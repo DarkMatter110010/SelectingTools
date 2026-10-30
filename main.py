@@ -105,7 +105,9 @@ class ViewerWidget(QWidget):
         self.image_label.setStyleSheet("background:#000; border-radius:10px;")
 
         self.status_label = QLabel(self)
-        self.status_label.setStyleSheet("color:#66ccff; font-size:14px;")
+        self.status_label.setStyleSheet(
+            "color:#66ccff; font-size:14px; background:rgba(0,0,0,0.45); "
+            "border-radius:4px; padding:2px 6px;")
         self.status_label.setText("")
 
         self.progress = SeekSlider(Qt.Orientation.Horizontal, self)
@@ -336,7 +338,8 @@ class MainWindow(QWidget):
                                           margin:-4px 0; border-radius:7px; }}
         """)
         self.viewer.status_label.setStyleSheet(
-            f"color:{'#66ccff' if dark else '#0066cc'}; font-size:14px;")
+            f"color:{'#66ccff' if dark else '#0066cc'}; font-size:14px; "
+            f"background:rgba(0,0,0,0.45); border-radius:4px; padding:2px 6px;")
 
     # ------------------------------------------------------------------ 目录
     def choose_work(self):

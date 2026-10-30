@@ -1,0 +1,989 @@
+#include "pch.h"
+#include "ProfileViewModel.h"
+#if __has_include("ProfileViewModel.g.cpp")
+#include "ProfileViewModel.g.cpp"
+#endif
+#include "AdaptersService.h"
+#include "App.h"
+#include "AppSettings.h"
+#include "AppXReader.h"
+#include "FileDialogHelper.h"
+#include "IconHelper.h"
+#include "LocalizationService.h"
+#include "Logger.h"
+#include "MainWindow.h"
+#include "Profile.h"
+#include "ProfileService.h"
+#include "ScalingMode.h"
+#include "ScalingService.h"
+#include "ScreenshotFilenameTemplateHelper.h"
+#include "StrHelper.h"
+#include "Win32Helper.h"
+
+using namespace ::Magpie;
+using namespace winrt;
+using namespace Windows::Graphics::Display;
+using namespace Windows::Graphics::Imaging;
+using namespace Windows::UI::Xaml::Controls;
+using namespace Windows::UI::Xaml::Media::Imaging;
+
+namespace winrt::Magpie::implementation {
+
+ProfileViewModel::ProfileViewModel(int profileIdx) : _isDefaultProfile(profileIdx < 0) {
+	if (_isDefaultProfile) {
+		_data = &ProfileService::Get().DefaultProfile();
+	} else {
+		_index = (uint32_t)profileIdx;
+		_data = &ProfileService::Get().GetProfile(profileIdx);
+
+		// 占位
+		_icon = FontIcon();
+
+		_appThemeChangedRevoker = App::Get().ThemeChanged(auto_revoke, [this](bool) { _LoadIcon(); });
+		_dpiChangedRevoker = App::Get().MainWindow().DpiChanged(
+			auto_revoke, [this](uint32_t) { _LoadIcon(); });
+
+		_canLaunch = _data->CanLaunch();
+
+		_LoadIcon();
+	}
+
+	_adaptersChangedRevoker = AdaptersService::Get().AdaptersChanged(auto_revoke,
+		std::bind_front(&ProfileViewModel::_AdaptersService_AdaptersChanged, this));
+
+	_isScreenshotFilenameTemplateValid = _data->screenshotFilenameTemplate.empty() ||
+		ScreenshotFilenameTemplateHelper::IsValid(_data->screenshotFilenameTemplate);
+}
+
+ProfileViewModel::~ProfileViewModel() {}
+
+bool ProfileViewModel::IsNotDefaultProfile() const noexcept {
+	return !_data->name.empty();
+}
+
+bool ProfileViewModel::IsNotPackaged() const noexcept {
+	return !_data->isPackaged;
+}
+
+void ProfileViewModel::OpenProgramLocation() const noexcept {
+	_data->OpenProgramLocation();
+}
+
+static std::wstring ExtractFolder(const std::wstring& path) noexcept {
+	const size_t delimPos = path.find_last_of(L'\\');
+	if (delimPos == std::wstring::npos) {
+		assert(false);
+		return {};
+	}
+
+	std::wstring result = path.substr(0, delimPos);
+	if (Win32Helper::DirExists(result.c_str())) {
+		return result;
+	} else {
+		return {};
+	}
+}
+
+static std::wstring GetStartFolderForSettingLauncher(const Profile& profile) noexcept {
+	if (profile.launcherPath.empty()) {
+		// 无启动器
+		return ExtractFolder(profile.pathRule);
+	}
+
+	std::wstring result = ExtractFolder(profile.launcherPath);
+	if (result.empty()) {
+		// 启动器路径失效
+		return ExtractFolder(profile.pathRule);
+	} else {
+		return result;
+	}
+}
+
+fire_and_forget ProfileViewModel::ChangeExeForLaunching() noexcept {
+	if (!_canLaunch || _data->isPackaged) {
+		co_return;
+	}
+
+	LocalizationService& ls = LocalizationService::Get();
+	const hstring titleStr = ls.GetLocalizedString(L"Dialog_SelectLauncher_Title");
+	const hstring exeFileStr = ls.GetLocalizedString(L"Dialog_ExeFile");
+
+	std::wstring startFolder = GetStartFolderForSettingLauncher(*_data);
+
+	auto weakThis = get_weak();
+
+	// 在主线程使用 IFileOpenDialog 有些问题，尤其在 Win10 中
+	co_await resume_background();
+
+	com_ptr<IFileOpenDialog> fileDialog = try_create_instance<IFileOpenDialog>(CLSID_FileOpenDialog);
+	if (!fileDialog) {
+		Logger::Get().Error("创建 FileSaveDialog 失败");
+		co_return;
+	}
+
+	fileDialog->SetTitle(titleStr.c_str());
+	{
+		const COMDLG_FILTERSPEC fileType{ exeFileStr.c_str(), L"*.exe" };
+		fileDialog->SetFileTypes(1, &fileType);
+	}
+	fileDialog->SetDefaultExtension(L"exe");
+
+	if (!startFolder.empty()) {
+		com_ptr<IShellItem> shellItem;
+		SHCreateItemFromParsingName(startFolder.c_str(), nullptr, IID_PPV_ARGS(&shellItem));
+		fileDialog->SetFolder(shellItem.get());
+	}
+
+	// GH#1158
+	// 选择 exe 的快捷方式时 IFileOpenDialog 默认解析它指向的文件路径，导致参数丢失。
+	// FOS_NODEREFERENCELINKS 可以禁止解析，直接返回 lnk 文件。
+	std::optional<std::filesystem::path> launcherPath = FileDialogHelper::OpenFileDialog(
+		fileDialog.get(), FOS_STRICTFILETYPES | FOS_NODEREFERENCELINKS);
+	if (!launcherPath || launcherPath->empty() || *launcherPath == _data->pathRule) {
+		co_return;
+	}
+
+	co_await App::Get().Dispatcher();
+
+	if (weakThis.get()) {
+		_data->launcherPath = std::move(*launcherPath);
+		AppSettings::Get().SaveAsync();
+	}
+}
+
+hstring ProfileViewModel::Name() const noexcept {
+	if (_data->name.empty()) {
+		LocalizationService& ls = LocalizationService::Get();
+		return ls.GetLocalizedString(L"Root_Defaults/Content");
+	} else {
+		return hstring(_data->name);
+	}
+}
+
+void ProfileViewModel::Launch() const noexcept {
+	_data->Launch();
+}
+
+void ProfileViewModel::RenameText(const hstring& value) {
+	_renameText = value;
+	RaisePropertyChanged(L"RenameText");
+
+	_trimedRenameText = value;
+	StrHelper::Trim(_trimedRenameText);
+	bool newEnabled = !_trimedRenameText.empty() && _trimedRenameText != _data->name;
+	if (_isRenameConfirmButtonEnabled != newEnabled) {
+		_isRenameConfirmButtonEnabled = newEnabled;
+		RaisePropertyChanged(L"IsRenameConfirmButtonEnabled");
+	}
+}
+
+void ProfileViewModel::Rename() {
+	if (_isDefaultProfile || !_isRenameConfirmButtonEnabled) {
+		return;
+	}
+
+	ProfileService::Get().RenameProfile(_index, _trimedRenameText);
+	RaisePropertyChanged(L"Name");
+}
+
+bool ProfileViewModel::CanMoveUp() const noexcept {
+	return !_isDefaultProfile && _index != 0;
+}
+
+bool ProfileViewModel::CanMoveDown() const noexcept {
+	return !_isDefaultProfile && _index + 1 < ProfileService::Get().GetProfileCount();
+}
+
+void ProfileViewModel::MoveUp() {
+	if (_isDefaultProfile) {
+		return;
+	}
+
+	ProfileService& profileService = ProfileService::Get();
+	if (!profileService.MoveProfile(_index, true)) {
+		return;
+	}
+
+	--_index;
+	_data = &profileService.GetProfile(_index);
+
+	RaisePropertyChanged(L"CanMoveUp");
+	RaisePropertyChanged(L"CanMoveDown");
+}
+
+void ProfileViewModel::MoveDown() {
+	if (_isDefaultProfile) {
+		return;
+	}
+
+	ProfileService& profileService = ProfileService::Get();
+	if (!profileService.MoveProfile(_index, false)) {
+		return;
+	}
+
+	++_index;
+	_data = &profileService.GetProfile(_index);
+
+	RaisePropertyChanged(L"CanMoveUp");
+	RaisePropertyChanged(L"CanMoveDown");
+}
+
+void ProfileViewModel::Delete() {
+	if (_isDefaultProfile) {
+		return;
+	}
+
+	ProfileService::Get().RemoveProfile(_index);
+	_data = nullptr;
+}
+
+IVector<IInspectable> ProfileViewModel::ScalingModes() const noexcept {
+	LocalizationService& ls = LocalizationService::Get();
+	
+	std::vector<IInspectable> scalingModes;
+	scalingModes.push_back(box_value(ls.GetLocalizedString(L"Profile_General_ScalingMode_None")));
+	for (const ::Magpie::ScalingMode& sm : AppSettings::Get().ScalingModes()) {
+		scalingModes.push_back(box_value(sm.name));
+	}
+
+	return single_threaded_vector(std::move(scalingModes));
+}
+
+int ProfileViewModel::ScalingMode() const noexcept {
+	return _data->scalingMode + 1;
+}
+
+void ProfileViewModel::ScalingMode(int value) {
+	_data->scalingMode = value - 1;
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"ScalingMode");
+}
+
+IVector<IInspectable> ProfileViewModel::CaptureMethods() const noexcept {
+	std::vector<IInspectable> captureMethods;
+	captureMethods.reserve(4);
+	captureMethods.push_back(box_value(L"Graphics Capture"));
+	if (Win32Helper::GetOSVersion().Is20H1OrNewer()) {
+		// Desktop Duplication 要求 Win10 20H1+
+		captureMethods.push_back(box_value(L"Desktop Duplication"));
+	}
+	captureMethods.push_back(box_value(L"GDI"));
+	captureMethods.push_back(box_value(L"DwmSharedSurface"));
+
+	return single_threaded_vector(std::move(captureMethods));
+}
+
+int ProfileViewModel::CaptureMethod() const noexcept {
+	if (Win32Helper::GetOSVersion().Is20H1OrNewer() || _data->captureMethod < CaptureMethod::DesktopDuplication) {
+		return (int)_data->captureMethod;
+	} else {
+		return (int)_data->captureMethod - 1;
+	}
+}
+
+void ProfileViewModel::CaptureMethod(int value) {
+	if (value < 0) {
+		return;
+	}
+
+	if (!Win32Helper::GetOSVersion().Is20H1OrNewer() && value >= (int)CaptureMethod::DesktopDuplication) {
+		++value;
+	}
+
+	enum CaptureMethod captureMethod = (enum CaptureMethod)value;
+	if (_data->captureMethod == captureMethod) {
+		return;
+	}
+
+	_data->captureMethod = captureMethod;
+	RaisePropertyChanged(L"CaptureMethod");
+	RaisePropertyChanged(L"IsCaptureMethodDesktopDuplication");
+	RaisePropertyChanged(L"CanCaptureTitleBar");
+
+	AppSettings::Get().SaveAsync();
+}
+
+bool ProfileViewModel::IsCaptureMethodDesktopDuplication() const noexcept {
+	return _data->captureMethod == CaptureMethod::DesktopDuplication;
+}
+
+int ProfileViewModel::AutoScale() const noexcept {
+	return (int)_data->autoScale;
+}
+
+void ProfileViewModel::AutoScale(int value) {
+	if (value < 0) {
+		return;
+	}
+
+	enum AutoScale enumValue = (enum AutoScale)value;
+	if (_data->autoScale == enumValue) {
+		return;
+	}
+
+	_data->autoScale = enumValue;
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"AutoScale");
+
+	if (value) {
+		// 立即检查前台窗口是否应自动缩放
+		ScalingService::Get().CheckForeground();
+	}
+}
+
+bool ProfileViewModel::Is3DGameMode() const noexcept {
+	return _data->Is3DGameMode();
+}
+
+void ProfileViewModel::Is3DGameMode(bool value) {
+	if (_data->Is3DGameMode() == value) {
+		return;
+	}
+
+	_data->Is3DGameMode(value);
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"Is3DGameMode");
+}
+
+bool ProfileViewModel::HasMultipleMonitors() const noexcept {
+	return GetSystemMetrics(SM_CMONITORS) > 1;
+}
+
+int ProfileViewModel::MultiMonitorUsage() const noexcept {
+	return (int)_data->multiMonitorUsage;
+}
+
+void ProfileViewModel::MultiMonitorUsage(int value) {
+	if (value < 0) {
+		return;
+	}
+
+	::Magpie::MultiMonitorUsage multiMonitorUsage = (::Magpie::MultiMonitorUsage)value;
+	if (_data->multiMonitorUsage == multiMonitorUsage) {
+		return;
+	}
+
+	_data->multiMonitorUsage = multiMonitorUsage;
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"MultiMonitorUsage");
+}
+
+int ProfileViewModel::InitialWindowedScaleFactor() const noexcept {
+	return (int)_data->initialWindowedScaleFactor;
+}
+
+void ProfileViewModel::InitialWindowedScaleFactor(int value) {
+	if (value < 0) {
+		return;
+	}
+
+	::Magpie::InitialWindowedScaleFactor factor = (::Magpie::InitialWindowedScaleFactor)value;
+	if (_data->initialWindowedScaleFactor == factor) {
+		return;
+	}
+
+	_data->initialWindowedScaleFactor = factor;
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"InitialWindowedScaleFactor");
+}
+
+double ProfileViewModel::CustomInitialWindowedScaleFactor() const noexcept {
+	return _data->customInitialWindowedScaleFactor;
+}
+
+void ProfileViewModel::CustomInitialWindowedScaleFactor(double value) {
+	if (_data->customInitialWindowedScaleFactor == value) {
+		return;
+	}
+
+	_data->customInitialWindowedScaleFactor = std::isnan(value) ? 1.0f : (float)value;
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"CustomInitialWindowedScaleFactor");
+}
+
+hstring ProfileViewModel::InitialToolbarStateDescription() const noexcept {
+	static constexpr std::array STATE_STRING_IDS = {
+		L"Profile_Toolbar_InitialState_Off/Content",
+		L"Profile_Toolbar_InitialState_AlwaysShow/Content",
+		L"Profile_Toolbar_InitialState_AutoHide/Content"
+	};
+
+	LocalizationService& ls = LocalizationService::Get();
+	if (_data->fullscreenInitialToolbarState == _data->windowedInitialToolbarState) {
+		return ls.GetLocalizedString(STATE_STRING_IDS[(uint32_t)_data->fullscreenInitialToolbarState]);
+	} else {
+		return hstring(StrHelper::Concat(
+			ls.GetLocalizedString(STATE_STRING_IDS[(uint32_t)_data->fullscreenInitialToolbarState]),
+			L" | ",
+			ls.GetLocalizedString(STATE_STRING_IDS[(uint32_t)_data->windowedInitialToolbarState]))
+		);
+	}
+}
+
+int ProfileViewModel::FullscreenInitialToolbarState() const noexcept {
+	return (int)_data->fullscreenInitialToolbarState;
+}
+
+void ProfileViewModel::FullscreenInitialToolbarState(int value) {
+	if (value < 0) {
+		return;
+	}
+
+	const ToolbarState state = (ToolbarState)value;
+
+	if (_data->fullscreenInitialToolbarState == state) {
+		return;
+	}
+
+	_data->fullscreenInitialToolbarState = state;
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"FullscreenInitialToolbarState");
+	RaisePropertyChanged(L"InitialToolbarStateDescription");
+}
+
+int ProfileViewModel::WindowedInitialToolbarState() const noexcept {
+	return (int)_data->windowedInitialToolbarState;
+}
+
+void ProfileViewModel::WindowedInitialToolbarState(int value) {
+	if (value < 0) {
+		return;
+	}
+
+	const ToolbarState state = (ToolbarState)value;
+
+	if (_data->windowedInitialToolbarState == state) {
+		return;
+	}
+
+	_data->windowedInitialToolbarState = state;
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"WindowedInitialToolbarState");
+	RaisePropertyChanged(L"InitialToolbarStateDescription");
+}
+
+hstring ProfileViewModel::ScreenshotSaveDirectory() const noexcept {
+	return hstring(_data->GetScreenshotsDir().native());
+}
+
+void ProfileViewModel::OpenScreenshotSaveDirectory() const noexcept {
+	const std::filesystem::path saveDir = _data->GetScreenshotsDir();
+	if (Win32Helper::CreateDir(saveDir.native(), true)) {
+		Win32Helper::ShellOpen(saveDir.c_str());
+	}
+}
+
+fire_and_forget ProfileViewModel::ChangeScreenshotSaveDirectory() noexcept {
+	const hstring titleStr = LocalizationService::Get()
+		.GetLocalizedString(L"Dialog_SelectScreenshotSaveDirectory_Title");
+
+	const std::filesystem::path oldValue = _data->GetScreenshotsDir();
+
+	auto weakThis = get_weak();
+
+	// 在主线程使用 IFileOpenDialog 有些问题，尤其在 Win10 中
+	co_await resume_background();
+
+	com_ptr<IFileOpenDialog> pickFolderDialog =
+		try_create_instance<IFileOpenDialog>(CLSID_FileOpenDialog);
+	if (!pickFolderDialog) {
+		Logger::Get().Error("创建 FileSaveDialog 失败");
+		co_return;
+	}
+
+	pickFolderDialog->SetTitle(titleStr.c_str());
+
+	if (!oldValue.empty()) {
+		// 选择父目录作为初始目录
+		const std::filesystem::path parentDir = oldValue.parent_path();
+
+		com_ptr<IShellItem> shellItem;
+		HRESULT hr = SHCreateItemFromParsingName(
+			parentDir.empty() ? oldValue.c_str() : parentDir.c_str(),
+			nullptr,
+			IID_PPV_ARGS(&shellItem)
+		);
+		if (SUCCEEDED(hr)) {
+			pickFolderDialog->SetFolder(shellItem.get());
+		} else {
+			Logger::Get().ComError("SHCreateItemFromParsingName 失败", hr);
+		}
+	}
+
+	std::optional<std::filesystem::path> screenshotDir =
+		FileDialogHelper::OpenFileDialog(pickFolderDialog.get(), FOS_PICKFOLDERS);
+	if (!screenshotDir || screenshotDir->empty() || *screenshotDir == oldValue) {
+		co_return;
+	}
+
+	co_await App::Get().Dispatcher();
+
+	if (weakThis.get()) {
+		_data->SetScreenshotsDir(*screenshotDir);
+		AppSettings::Get().SaveAsync();
+
+		RaisePropertyChanged(L"ScreenshotSaveDirectory");
+	}
+}
+
+hstring ProfileViewModel::ScreenshotFilenameTemplate() const noexcept {
+	return to_hstring(_data->screenshotFilenameTemplate);
+}
+
+void ProfileViewModel::ScreenshotFilenameTemplate(const hstring& value) {
+	std::wstring_view trimmed(value);
+	StrHelper::Trim(trimmed);
+	std::string str = StrHelper::UTF16ToUTF8(trimmed);
+
+	_data->screenshotFilenameTemplate = str;
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"ScreenshotFilenameTemplate");
+
+	bool isValid = str.empty() || ScreenshotFilenameTemplateHelper::IsValid(str);
+	if (_isScreenshotFilenameTemplateValid != isValid) {
+		_isScreenshotFilenameTemplateValid = isValid;
+		RaisePropertyChanged(L"IsScreenshotFilenameTemplateValid");
+	}
+}
+
+IVector<IInspectable> ProfileViewModel::GraphicsCards() const noexcept {
+	std::vector<IInspectable> graphicsCards;
+
+	if (IsShowGraphicsCardSettingsCard()) {
+		const std::vector<AdapterInfo>& adapterInfos = AdaptersService::Get().AdapterInfos();
+		graphicsCards.reserve(adapterInfos.size() + 1);
+
+		LocalizationService& ls = LocalizationService::Get();
+		hstring defaultStr = ls.GetLocalizedString(L"Profile_General_CaptureMethod_Default");
+
+		// “默认”选项中显示实际使用的显卡
+		graphicsCards.push_back(box_value(
+			StrHelper::Concat(defaultStr, L" (", adapterInfos[0].description, L")")));
+
+		for (const AdapterInfo& adapterInfo : adapterInfos) {
+			graphicsCards.push_back(box_value(adapterInfo.description));
+		}
+	}
+
+	return single_threaded_vector(std::move(graphicsCards));
+}
+
+int ProfileViewModel::GraphicsCard() const noexcept {
+	if (_data->graphicsCardId.idx < 0) {
+		return 0;
+	}
+
+	// 不要把 graphicsCardId.idx 当作位序使用，AdaptersService 会过滤掉不支持 FL11 的显卡
+	const std::vector<AdapterInfo>& adapterInfos = AdaptersService::Get().AdapterInfos();
+	auto it = std::find_if(adapterInfos.begin(), adapterInfos.end(),
+		[&](const AdapterInfo& ai) { return (int)ai.idx == _data->graphicsCardId.idx; });
+	if (it == adapterInfos.end()) {
+		assert(false);
+		return 0;
+	}
+
+	return int(it - adapterInfos.begin()) + 1;
+}
+
+void ProfileViewModel::GraphicsCard(int value) {
+	if (value < 0 || _isHandlingAdapterChanged) {
+		return;
+	}
+
+	GraphicsCardId& gcid = _data->graphicsCardId;
+
+	const std::vector<AdapterInfo>& adapterInfos = AdaptersService::Get().AdapterInfos();
+	if (value == 0 || value - 1 >= (int)adapterInfos.size()) {
+		// 设为默认显卡，并清空 vendorId 和 deviceId
+		gcid.idx = -1;
+		gcid.vendorId = 0;
+		gcid.deviceId = 0;
+	} else {
+		const AdapterInfo& ai = adapterInfos[size_t(value - 1)];
+		gcid.idx = ai.idx;
+		gcid.vendorId = ai.vendorId;
+		gcid.deviceId = ai.deviceId;
+	}
+	
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"GraphicsCard");
+}
+
+bool ProfileViewModel::IsShowGraphicsCardSettingsCard() const noexcept {
+	return AdaptersService::Get().AdapterInfos().size() > 1;
+}
+
+bool ProfileViewModel::IsNoGraphicsCard() const noexcept {
+	return AdaptersService::Get().AdapterInfos().empty();
+}
+
+bool ProfileViewModel::IsFrameRateLimiterEnabled() const noexcept {
+	return _data->isFrameRateLimiterEnabled;
+}
+
+void ProfileViewModel::IsFrameRateLimiterEnabled(bool value) {
+	if (_data->isFrameRateLimiterEnabled == value) {
+		return;
+	}
+
+	_data->isFrameRateLimiterEnabled = value;
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"IsFrameRateLimiterEnabled");
+}
+
+double ProfileViewModel::MaxFrameRate() const noexcept {
+	return _data->maxFrameRate;
+}
+
+void ProfileViewModel::MaxFrameRate(double value) {
+	if (_data->maxFrameRate == value) {
+		return;
+	}
+
+	// 用户已清空数字框则重置为 60
+	_data->maxFrameRate = std::isnan(value) ? 60.0f : (float)value;
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"MaxFrameRate");
+}
+
+bool ProfileViewModel::IsCaptureTitleBar() const noexcept {
+	return _data->IsCaptureTitleBar();
+}
+
+void ProfileViewModel::IsCaptureTitleBar(bool value) {
+	if (_data->IsCaptureTitleBar() == value) {
+		return;
+	}
+
+	_data->IsCaptureTitleBar(value);
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"IsCaptureTitleBar");
+}
+
+bool ProfileViewModel::CanCaptureTitleBar() const noexcept {
+	return _data->captureMethod == CaptureMethod::GraphicsCapture
+		|| _data->captureMethod == CaptureMethod::DesktopDuplication;
+}
+
+bool ProfileViewModel::IsCroppingEnabled() const noexcept {
+	return _data->isCroppingEnabled;
+}
+
+void ProfileViewModel::IsCroppingEnabled(bool value) {
+	if (_data->isCroppingEnabled == value) {
+		return;
+	}
+
+	_data->isCroppingEnabled = value;
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"IsCroppingEnabled");
+}
+
+double ProfileViewModel::CroppingLeft() const noexcept {
+	return _data->cropping.Left;
+}
+
+void ProfileViewModel::CroppingLeft(double value) {
+	if (_data->cropping.Left == value) {
+		return;
+	}
+
+	_data->cropping.Left = std::isnan(value) ? 0.0f : (float)value;
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"CroppingLeft");
+}
+
+double ProfileViewModel::CroppingTop() const noexcept {
+	return _data->cropping.Top;
+}
+
+void ProfileViewModel::CroppingTop(double value) {
+	if (_data->cropping.Top == value) {
+		return;
+	}
+
+	// 用户已清空数字框则重置为 0
+	_data->cropping.Top = std::isnan(value) ? 0.0f : (float)value;
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"CroppingTop");
+}
+
+double ProfileViewModel::CroppingRight() const noexcept {
+	return _data->cropping.Right;
+}
+
+void ProfileViewModel::CroppingRight(double value) {
+	if (_data->cropping.Right == value) {
+		return;
+	}
+
+	_data->cropping.Right = std::isnan(value) ? 0.0f : (float)value;
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"CroppingRight");
+}
+
+double ProfileViewModel::CroppingBottom() const noexcept {
+	return _data->cropping.Bottom;
+}
+
+void ProfileViewModel::CroppingBottom(double value) {
+	if (_data->cropping.Bottom == value) {
+		return;
+	}
+
+	_data->cropping.Bottom = std::isnan(value) ? 0.0f : (float)value;
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"CroppingBottom");
+}
+
+bool ProfileViewModel::IsAdjustCursorSpeed() const noexcept {
+	return _data->IsAdjustCursorSpeed();
+}
+
+void ProfileViewModel::IsAdjustCursorSpeed(bool value) {
+	if (_data->IsAdjustCursorSpeed() == value) {
+		return;
+	}
+
+	_data->IsAdjustCursorSpeed(value);
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"IsAdjustCursorSpeed");
+}
+
+int ProfileViewModel::CursorScaling() const noexcept {
+	return (int)_data->cursorScaling;
+}
+
+void ProfileViewModel::CursorScaling(int value) {
+	if (value < 0) {
+		return;
+	}
+
+	::Magpie::CursorScaling cursorScaling = (::Magpie::CursorScaling)value;
+	if (_data->cursorScaling == cursorScaling) {
+		return;
+	}
+
+	_data->cursorScaling = cursorScaling;
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"CursorScaling");
+}
+
+double ProfileViewModel::CustomCursorScaleFactor() const noexcept {
+	return _data->customCursorScaleFactor;
+}
+
+void ProfileViewModel::CustomCursorScaleFactor(double value) {
+	if (_data->customCursorScaleFactor == value) {
+		return;
+	}
+
+	_data->customCursorScaleFactor = std::isnan(value) ? 1.0f : (float)value;
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"CustomCursorScaleFactor");
+}
+
+int ProfileViewModel::CursorInterpolationMode() const noexcept {
+	return (int)_data->cursorInterpolationMode;
+}
+
+void ProfileViewModel::CursorInterpolationMode(int value) {
+	if (value < 0) {
+		return;
+	}
+
+	::Magpie::CursorInterpolationMode cursorInterpolationMode = (::Magpie::CursorInterpolationMode)value;
+	if (_data->cursorInterpolationMode == cursorInterpolationMode) {
+		return;
+	}
+
+	_data->cursorInterpolationMode = cursorInterpolationMode;
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"CursorInterpolationMode");
+}
+
+bool ProfileViewModel::IsAutoHideCursorEnabled() const noexcept {
+	return _data->isAutoHideCursorEnabled;
+}
+
+void ProfileViewModel::IsAutoHideCursorEnabled(bool value) {
+	if (_data->isAutoHideCursorEnabled == value) {
+		return;
+	}
+
+	_data->isAutoHideCursorEnabled = value;
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"IsAutoHideCursorEnabled");
+}
+
+double ProfileViewModel::AutoHideCursorDelay() const noexcept {
+	return _data->autoHideCursorDelay;
+}
+
+void ProfileViewModel::AutoHideCursorDelay(double value) {
+	if (_data->autoHideCursorDelay == value) {
+		return;
+	}
+
+	_data->autoHideCursorDelay = std::isnan(value) ? 3.0f : (float)value;
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"AutoHideCursorDelay");
+	RaisePropertyChanged(L"AutoHideCursorDelayText");
+}
+
+hstring ProfileViewModel::AutoHideCursorDelayText() const noexcept {
+	return App::Get().DoubleFormatter().FormatDouble(AutoHideCursorDelay());
+}
+
+hstring ProfileViewModel::LaunchParameters() const noexcept {
+	return hstring(_data->launchParameters);
+}
+
+void ProfileViewModel::LaunchParameters(const hstring& value) {
+	std::wstring_view trimmed(value);
+	StrHelper::Trim(trimmed);
+	_data->launchParameters = trimmed;
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"LaunchParameters");
+}
+
+int ProfileViewModel::OutputAlignment() const noexcept {
+	return (int)_data->outputAlignment;
+}
+
+void ProfileViewModel::OutputAlignment(int value) {
+	if (value < 0) {
+		return;
+	}
+
+	::Magpie::OutputAlignment alignment = (::Magpie::OutputAlignment)value;
+	if (_data->outputAlignment == alignment) {
+		return;
+	}
+
+	_data->outputAlignment = alignment;
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"OutputAlignment");
+}
+
+bool ProfileViewModel::IsDirectFlipDisabled() const noexcept {
+	return _data->IsDirectFlipDisabled();
+}
+
+void ProfileViewModel::IsDirectFlipDisabled(bool value) {
+	if (_data->IsDirectFlipDisabled() == value) {
+		return;
+	}
+
+	_data->IsDirectFlipDisabled(value);
+	AppSettings::Get().SaveAsync();
+
+	RaisePropertyChanged(L"IsDirectFlipDisabled");
+}
+
+fire_and_forget ProfileViewModel::_LoadIcon() {
+	std::wstring iconPath;
+	SoftwareBitmap iconBitmap{ nullptr };
+
+	auto weakThis = get_weak();
+
+	// 单位为 DIP
+	constexpr double ICON_SIZE = 32.0;
+
+	if (_canLaunch) {
+		const bool preferLightTheme = App::Get().IsLightTheme();
+		const bool isPackaged = _data->isPackaged;
+		const std::wstring path = _data->pathRule;
+		const uint32_t iconSize =
+			(uint32_t)std::lround(ICON_SIZE * App::Get().MainWindow().GetDpi() / USER_DEFAULT_SCREEN_DPI);
+
+		co_await resume_background();
+
+		if (isPackaged) {
+			AppXReader appxReader;
+			[[maybe_unused]] bool result = appxReader.Initialize(path);
+			assert(result);
+
+			std::variant<std::wstring, SoftwareBitmap> uwpIcon =
+				appxReader.GetIcon(iconSize, preferLightTheme);
+			if (uwpIcon.index() == 0) {
+				iconPath = std::get<0>(uwpIcon);
+			} else {
+				iconBitmap = std::get<1>(uwpIcon);
+			}
+		} else {
+			iconBitmap = IconHelper::ExtractIconFromExe(path.c_str(), iconSize);
+		}
+
+		co_await App::Get().Dispatcher();
+		if (!weakThis.get()) {
+			co_return;
+		}
+	}
+
+	if (!iconPath.empty()) {
+		BitmapIcon icon;
+		icon.ShowAsMonochrome(false);
+		icon.UriSource(Uri(iconPath));
+
+		_icon = std::move(icon);
+	} else if (iconBitmap) {
+		SoftwareBitmapSource imageSource;
+		co_await imageSource.SetBitmapAsync(iconBitmap);
+
+		if (!weakThis.get()) {
+			co_return;
+		}
+
+		MUXC::ImageIcon imageIcon;
+		imageIcon.Source(imageSource);
+
+		_icon = std::move(imageIcon);
+	} else {
+		_icon = nullptr;
+	}
+
+	if (_icon) {
+		_icon.Width(ICON_SIZE);
+		_icon.Height(ICON_SIZE);
+	}
+
+	RaisePropertyChanged(L"Icon");
+}
+
+void ProfileViewModel::_AdaptersService_AdaptersChanged() {
+	_isHandlingAdapterChanged = true;
+	RaisePropertyChanged(L"IsShowGraphicsCardSettingsCard");
+	RaisePropertyChanged(L"IsNoGraphicsCard");
+	RaisePropertyChanged(L"GraphicsCards");
+	RaisePropertyChanged(L"GraphicsCard");
+	_isHandlingAdapterChanged = false;
+}
+
+}

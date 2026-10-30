@@ -1,0 +1,533 @@
+#include "pch.h"
+#include "HomeViewModel.h"
+#if __has_include("HomeViewModel.g.cpp")
+#include "HomeViewModel.g.cpp"
+#endif
+#include "App.h"
+#include "AppSettings.h"
+#include "CommonSharedConstants.h"
+#include "LocalizationService.h"
+#include "RootPage.h"
+#include "ScalingService.h"
+#include "StrHelper.h"
+#include "TouchHelper.h"
+#include "UpdateService.h"
+#include "Win32Helper.h"
+
+using namespace Magpie;
+
+namespace winrt::Magpie::implementation {
+
+HomeViewModel::HomeViewModel() {
+	ScalingService& ScalingService = ScalingService::Get();
+
+	_isScalingChangedRevoker = ScalingService.IsScalingChanged(
+		auto_revoke, std::bind_front(&HomeViewModel::_ScalingService_IsScalingChanged, this));
+	_isTimerOnRevoker = ScalingService.IsTimerOnChanged(
+		auto_revoke, std::bind_front(&HomeViewModel::_ScalingService_IsTimerOnChanged, this));
+	_timerTickRevoker = ScalingService.TimerTick(
+		auto_revoke, std::bind_front(&HomeViewModel::_ScalingService_TimerTick, this));
+
+	UpdateService& updateService = UpdateService::Get();
+	_showUpdateCard = updateService.IsShowOnHomePage();
+	_isShowOnHomePageChangedRevoker = updateService.IsShowOnHomePageChanged(
+		auto_revoke,
+		[this](bool value) {
+			if (value) {
+				ShowUpdateCard(true);
+			}
+		}
+	);
+}
+
+hstring HomeViewModel::TimerDescription() const noexcept {
+	hstring fmtStr = LocalizationService::Get()
+		.GetLocalizedString(L"Home_Activation_Timer_Description");
+	// NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
+	return hstring(fmt::format(
+		fmt::runtime(std::wstring_view(fmtStr)),
+		AppSettings::Get().CountdownSeconds()
+	));
+}
+
+bool HomeViewModel::IsTimerOn() const noexcept {
+	return ScalingService::Get().IsTimerOn();
+}
+
+double HomeViewModel::TimerProgressRingValue() const noexcept {
+	ScalingService& ScalingService = ScalingService::Get();
+	return ScalingService.IsTimerOn() ? ScalingService.TimerProgress() : 1.0f;
+}
+
+hstring HomeViewModel::TimerLabelText() const noexcept {
+	ScalingService& ScalingService = ScalingService::Get();
+	return to_hstring((int)std::ceil(ScalingService.SecondsLeft()));
+}
+
+bool HomeViewModel::IsNotRunning() const noexcept {
+	return !ScalingService::Get().IsScaling();
+}
+
+hstring HomeViewModel::TimerButtonText(bool windowedMode) const noexcept {
+	LocalizationService& ls = LocalizationService::Get();
+	if (ScalingService::Get().IsTimerOn(windowedMode)) {
+		return ls.GetLocalizedString(L"Home_Activation_Timer_Cancel");
+	} else {
+		return ls.GetLocalizedString(L"Home_Activation_Timer_Start");
+	}
+}
+
+void HomeViewModel::ToggleTimerFullscreen() const noexcept {
+	_ToggleTimer(false);
+}
+
+void HomeViewModel::ToggleTimerWindowed() const noexcept {
+	_ToggleTimer(true);
+}
+
+uint32_t HomeViewModel::Delay() const noexcept {
+	return AppSettings::Get().CountdownSeconds();
+}
+
+void HomeViewModel::Delay(uint32_t value) {
+	AppSettings::Get().CountdownSeconds(value);
+	RaisePropertyChanged(L"Delay");
+	RaisePropertyChanged(L"DelayText");
+	RaisePropertyChanged(L"TimerDescription");
+}
+
+hstring HomeViewModel::DelayText() const noexcept {
+	return App::Get().DoubleFormatter().FormatDouble(Delay());
+}
+
+void HomeViewModel::ShowUpdateCard(bool value) noexcept {
+	_showUpdateCard = value;
+	if (!value) {
+		UpdateService::Get().IsShowOnHomePage(false);
+	}
+	
+	RaisePropertyChanged(L"ShowUpdateCard");
+	RaisePropertyChanged(L"UpdateCardTitle");
+}
+
+hstring HomeViewModel::UpdateCardTitle() const noexcept {
+	UpdateService& updateService = UpdateService::Get();
+	if (updateService.Status() < UpdateStatus::Available) {
+		return {};
+	}
+
+	hstring titleFmt = LocalizationService::Get()
+		.GetLocalizedString(L"About_Version_UpdateCard_Title");
+	return hstring(fmt::format(fmt::runtime(std::wstring_view(titleFmt)), updateService.Tag()));
+}
+
+bool HomeViewModel::IsAutoCheckForUpdates() const noexcept {
+	return AppSettings::Get().IsAutoCheckForUpdates();
+}
+
+void HomeViewModel::IsAutoCheckForUpdates(bool value) noexcept {
+	AppSettings::Get().IsAutoCheckForUpdates(value);
+}
+
+void HomeViewModel::DownloadAndInstall() {
+	UpdateService::Get().DownloadAndInstall();
+	App::Get().RootPage().NavigateToAboutPage();
+}
+
+void HomeViewModel::ReleaseNotes() {
+	std::wstring url = StrHelper::Concat(
+		L"https://github.com/Blinue/Magpie/releases/tag/",
+		UpdateService::Get().Tag()
+	);
+	Win32Helper::ShellOpen(url.c_str());
+}
+
+void HomeViewModel::RemindMeLater() {
+	ShowUpdateCard(false);
+}
+
+bool HomeViewModel::IsTouchSupportEnabled() const noexcept {
+	// 不检查版本号是否匹配
+	return TouchHelper::IsTouchSupportEnabled();
+}
+
+fire_and_forget HomeViewModel::IsTouchSupportEnabled(bool value) {
+	if (IsTouchSupportEnabled() == value) {
+		co_return;
+	}
+
+	auto weakThis = get_weak();
+
+	// UAC 可能导致 XAML Islands 崩溃，因此不能在主线程上执行 ShellExecute，
+	// 见 https://github.com/microsoft/microsoft-ui-xaml/issues/4952
+	co_await resume_background();
+
+	TouchHelper::IsTouchSupportEnabled(value);
+
+	co_await App::Get().Dispatcher();
+
+	if (weakThis.get()) {
+		RaisePropertyChanged(L"IsTouchSupportEnabled");
+		RaisePropertyChanged(L"IsShowTouchSupportInfoBar");
+	}
+}
+
+Uri HomeViewModel::TouchSupportLearnMoreUrl() const noexcept {
+	if (LocalizationService::Get().GetLanguage() == L"zh-hans"sv) {
+		return Uri(L"https://github.com/Blinue/Magpie/blob/dev/docs/%E5%85%B3%E4%BA%8E%E8%A7%A6%E6%8E%A7%E6%94%AF%E6%8C%81.md");
+	} else {
+		return Uri(L"https://github.com/Blinue/Magpie/blob/dev/docs/About%20touch%20support.md");
+	}
+}
+
+bool HomeViewModel::IsShowTouchSupportInfoBar() const noexcept {
+	return !Win32Helper::IsProcessElevated() && IsTouchSupportEnabled();
+}
+
+bool HomeViewModel::IsAllowScalingMaximized() const noexcept {
+	return AppSettings::Get().IsAllowScalingMaximized();
+}
+
+void HomeViewModel::IsAllowScalingMaximized(bool value) {
+	AppSettings& settings = AppSettings::Get();
+
+	if (settings.IsAllowScalingMaximized() == value) {
+		return;
+	}
+
+	settings.IsAllowScalingMaximized(value);
+	RaisePropertyChanged(L"IsAllowScalingMaximized");
+
+	if (value) {
+		ScalingService::Get().CheckForeground();
+	}
+}
+
+bool HomeViewModel::IsKeepScreenOn() const noexcept {
+	return AppSettings::Get().IsKeepScreenOn();
+}
+
+void HomeViewModel::IsKeepScreenOn(bool value) {
+	AppSettings& settings = AppSettings::Get();
+
+	if (settings.IsKeepScreenOn() == value) {
+		return;
+	}
+
+	settings.IsKeepScreenOn(value);
+	RaisePropertyChanged(L"IsKeepScreenOn");
+}
+
+bool HomeViewModel::IsSimulateExclusiveFullscreen() const noexcept {
+	return AppSettings::Get().IsSimulateExclusiveFullscreen();
+}
+
+void HomeViewModel::IsSimulateExclusiveFullscreen(bool value) {
+	AppSettings& settings = AppSettings::Get();
+
+	if (settings.IsSimulateExclusiveFullscreen() == value) {
+		return;
+	}
+
+	settings.IsSimulateExclusiveFullscreen(value);
+	RaisePropertyChanged(L"IsSimulateExclusiveFullscreen");
+}
+
+bool HomeViewModel::IsInlineParams() const noexcept {
+	return AppSettings::Get().IsInlineParams();
+}
+
+void HomeViewModel::IsInlineParams(bool value) {
+	AppSettings& settings = AppSettings::Get();
+
+	if (settings.IsInlineParams() == value) {
+		return;
+	}
+
+	settings.IsInlineParams(value);
+	RaisePropertyChanged(L"IsInlineParams");
+}
+
+static constexpr std::array MIN_FRAME_RATE_OPTIONS{ 0,5,10,15,20,30,60 };
+
+IVector<IInspectable> HomeViewModel::MinFrameRateOptions() {
+	static IVector<IInspectable> result = [] {
+		std::vector<IInspectable> options;
+		options.reserve(MIN_FRAME_RATE_OPTIONS.size());
+		for (int option : MIN_FRAME_RATE_OPTIONS) {
+			options.push_back(box_value(std::to_wstring(option)));
+		}
+
+		return single_threaded_vector(std::move(options));
+	}();
+	return result;
+}
+
+int HomeViewModel::MinFrameRateIndex() const noexcept {
+	float minFrameRate = AppSettings::Get().MinFrameRate();
+	auto it = std::find_if(
+		MIN_FRAME_RATE_OPTIONS.begin(),
+		MIN_FRAME_RATE_OPTIONS.end(),
+		[&](int value) { return IsApprox(minFrameRate, (float)value); }
+	);
+	if (it == MIN_FRAME_RATE_OPTIONS.end()) {
+		return -1;
+	} else {
+		return int(it - MIN_FRAME_RATE_OPTIONS.begin());
+	}
+}
+
+void HomeViewModel::MinFrameRateIndex(int value) {
+	if (value < 0 || value >= (int)MIN_FRAME_RATE_OPTIONS.size()) {
+		return;
+	}
+
+	AppSettings::Get().MinFrameRate((float)MIN_FRAME_RATE_OPTIONS[value]);
+	RaisePropertyChanged(L"MinFrameRateIndex");
+}
+
+bool HomeViewModel::IsDeveloperMode() const noexcept {
+	return AppSettings::Get().IsDeveloperMode();
+}
+
+void HomeViewModel::IsDeveloperMode(bool value) {
+	AppSettings& settings = AppSettings::Get();
+
+	if (settings.IsDeveloperMode() == value) {
+		return;
+	}
+
+	settings.IsDeveloperMode(value);
+	RaisePropertyChanged(L"IsDeveloperMode");
+}
+
+void HomeViewModel::LocateMagpieLogs() noexcept {
+	Win32Helper::ShellOpen(StrHelper::Concat(L".\\", CommonSharedConstants::LOGS_DIR).c_str());
+}
+
+static fire_and_forget LocateTempLogs(const wchar_t* logName) noexcept {
+	std::wstring path(MAX_PATH + 1, L'\0');
+
+	const DWORD len = GetTempPath(MAX_PATH + 2, path.data());
+	if (len <= 0) {
+		co_return;
+	}
+
+	path.resize(len);
+	if (!path.ends_with(L'\\')) {
+		path.push_back(L'\\');
+	}
+
+	path.append(logName);
+	if (!Win32Helper::FileExists(path.c_str())) {
+		co_return;
+	}
+
+	co_await resume_background();
+	Win32Helper::OpenFolderAndSelectFile(path.c_str());
+}
+
+void HomeViewModel::LocateTouchHelperLogs() noexcept {
+	LocateTempLogs(CommonSharedConstants::TOUCH_HELPER_LOG_NAME);
+}
+
+void HomeViewModel::LocateUpdaterLogs() noexcept {
+	LocateTempLogs(CommonSharedConstants::UPDATER_LOG_NAME);
+}
+
+bool HomeViewModel::IsDebugMode() const noexcept {
+	return AppSettings::Get().IsDebugMode();
+}
+
+void HomeViewModel::IsDebugMode(bool value) {
+	AppSettings& settings = AppSettings::Get();
+
+	if (settings.IsDebugMode() == value) {
+		return;
+	}
+
+	settings.IsDebugMode(value);
+	RaisePropertyChanged(L"IsDebugMode");
+}
+
+bool HomeViewModel::IsBenchmarkMode() const noexcept {
+	return AppSettings::Get().IsBenchmarkMode();
+}
+
+void HomeViewModel::IsBenchmarkMode(bool value) {
+	AppSettings& settings = AppSettings::Get();
+
+	if (settings.IsBenchmarkMode() == value) {
+		return;
+	}
+
+	settings.IsBenchmarkMode(value);
+	RaisePropertyChanged(L"IsBenchmarkMode");
+}
+
+bool HomeViewModel::IsTopmostDisabled() const noexcept {
+	return AppSettings::Get().IsTopmostDisabled();
+}
+
+void HomeViewModel::IsTopmostDisabled(bool value) {
+	AppSettings& settings = AppSettings::Get();
+
+	if (settings.IsTopmostDisabled() == value) {
+		return;
+	}
+
+	settings.IsTopmostDisabled(value);
+	RaisePropertyChanged(L"IsTopmostDisabled");
+}
+
+bool HomeViewModel::IsEffectCacheDisabled() const noexcept {
+	return AppSettings::Get().IsEffectCacheDisabled();
+}
+
+void HomeViewModel::IsEffectCacheDisabled(bool value) {
+	AppSettings& settings = AppSettings::Get();
+
+	if (settings.IsEffectCacheDisabled() == value) {
+		return;
+	}
+
+	settings.IsEffectCacheDisabled(value);
+	RaisePropertyChanged(L"IsEffectCacheDisabled");
+}
+
+bool HomeViewModel::IsFontCacheDisabled() const noexcept {
+	return AppSettings::Get().IsFontCacheDisabled();
+}
+
+void HomeViewModel::IsFontCacheDisabled(bool value) {
+	AppSettings& settings = AppSettings::Get();
+
+	if (settings.IsFontCacheDisabled() == value) {
+		return;
+	}
+
+	settings.IsFontCacheDisabled(value);
+	RaisePropertyChanged(L"IsFontCacheDisabled");
+}
+
+bool HomeViewModel::IsSaveEffectSources() const noexcept {
+	return AppSettings::Get().IsSaveEffectSources();
+}
+
+void HomeViewModel::IsSaveEffectSources(bool value) {
+	AppSettings& settings = AppSettings::Get();
+
+	if (settings.IsSaveEffectSources() == value) {
+		return;
+	}
+
+	settings.IsSaveEffectSources(value);
+	RaisePropertyChanged(L"IsSaveEffectSources");
+}
+
+bool HomeViewModel::IsWarningsAreErrors() const noexcept {
+	return AppSettings::Get().IsWarningsAreErrors();
+}
+
+void HomeViewModel::IsWarningsAreErrors(bool value) {
+	AppSettings& settings = AppSettings::Get();
+
+	if (settings.IsWarningsAreErrors() == value) {
+		return;
+	}
+
+	settings.IsWarningsAreErrors(value);
+	RaisePropertyChanged(L"IsWarningsAreErrors");
+}
+
+bool HomeViewModel::IsFP16Disabled() const noexcept {
+	return AppSettings::Get().IsFP16Disabled();
+}
+
+void HomeViewModel::IsFP16Disabled(bool value) {
+	AppSettings& settings = AppSettings::Get();
+
+	if (settings.IsFP16Disabled() == value) {
+		return;
+	}
+
+	settings.IsFP16Disabled(value);
+	RaisePropertyChanged(L"IsFP16Disabled");
+}
+
+int HomeViewModel::DuplicateFrameDetectionMode() const noexcept {
+	return (int)AppSettings::Get().DuplicateFrameDetectionMode();
+}
+
+void HomeViewModel::DuplicateFrameDetectionMode(int value) {
+	if (value < 0) {
+		return;
+	}
+
+	const auto mode = (::Magpie::DuplicateFrameDetectionMode)value;
+
+	AppSettings& settings = AppSettings::Get();
+	if (settings.DuplicateFrameDetectionMode() == mode) {
+		return;
+	}
+
+	settings.DuplicateFrameDetectionMode(mode);
+
+	RaisePropertyChanged(L"DuplicateFrameDetectionMode");
+	RaisePropertyChanged(L"IsDynamicDection");
+
+	if (mode != ::Magpie::DuplicateFrameDetectionMode::Dynamic) {
+		settings.IsStatisticsForDynamicDetectionEnabled(false);
+		RaisePropertyChanged(L"IsStatisticsForDynamicDetectionEnabled");
+	}
+}
+
+bool HomeViewModel::IsDynamicDection() const noexcept {
+	return AppSettings::Get().DuplicateFrameDetectionMode() == ::Magpie::DuplicateFrameDetectionMode::Dynamic;
+}
+
+bool HomeViewModel::IsStatisticsForDynamicDetectionEnabled() const noexcept {
+	return AppSettings::Get().IsStatisticsForDynamicDetectionEnabled();
+}
+
+void HomeViewModel::IsStatisticsForDynamicDetectionEnabled(bool value) {
+	AppSettings& settings = AppSettings::Get();
+
+	if (settings.IsStatisticsForDynamicDetectionEnabled() == value) {
+		return;
+	}
+
+	settings.IsStatisticsForDynamicDetectionEnabled(value);
+	RaisePropertyChanged(L"IsStatisticsForDynamicDetectionEnabled");
+}
+
+void HomeViewModel::_ScalingService_IsTimerOnChanged(bool value, bool) {
+	if (!value) {
+		RaisePropertyChanged(L"TimerProgressRingValue");
+	}
+
+	RaisePropertyChanged(L"TimerProgressRingValue");
+	RaisePropertyChanged(L"TimerLabelText");
+	RaisePropertyChanged(L"TimerButtonText");
+	RaisePropertyChanged(L"IsTimerOn");
+}
+
+void HomeViewModel::_ScalingService_TimerTick(double) {
+	RaisePropertyChanged(L"TimerProgressRingValue");
+	RaisePropertyChanged(L"TimerLabelText");
+}
+
+void HomeViewModel::_ScalingService_IsScalingChanged(bool) {
+	RaisePropertyChanged(L"IsNotRunning");
+}
+
+void HomeViewModel::_ToggleTimer(bool windowedMode) const noexcept {
+	ScalingService& scalingService = ScalingService::Get();
+	if (scalingService.IsTimerOn(windowedMode)) {
+		scalingService.StopTimer();
+	} else {
+		scalingService.StartTimer(windowedMode);
+	}
+}
+
+}

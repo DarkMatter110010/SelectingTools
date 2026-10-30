@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 尽可能早的导入 -->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|ARM64">
+      <Configuration>Debug</Configuration>
+    <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|ARM64">
+      <Configuration>Release</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <!-- 编译选项 -->
+  <Import Project="$(MSBuildThisFileDirectory)\BuildOptions.props" />
+
+  <PropertyGroup Label="Globals">
+    <MinimumVisualStudioVersion>18.0</MinimumVisualStudioVersion>
+    <VCProjectVersion>18.0</VCProjectVersion>
+    <DefaultLanguage>en-US</DefaultLanguage>
+    <IntDir>$(SolutionDir)\obj\$(Platform)\$(Configuration)\$(MSBuildProjectName)\</IntDir>
+    <OutBaseDir Condition="'$(OutBaseDir)' == ''">$(SolutionDir)\bin\$(Platform)\$(Configuration)\</OutBaseDir>
+    <!-- 使 clang-tidy 并行运行-->
+    <MaxNumberOfProcesses Condition="'$(MaxNumberOfProcesses)' == '' And $(RunCodeAnalysis) And $(UseClangCL)">0</MaxNumberOfProcesses>
+    <ClangTidyToolExeAdditionalOptions Condition="$(RunCodeAnalysis) And $(UseClangCL)">$(ClangTidyToolExeAdditionalOptions) --quiet</ClangTidyToolExeAdditionalOptions>
+    <!-- cppwinrt 经常有 clang-analyzer-core.CallAndMessage 警告，而且由于使用模板无法简单过滤 -->
+    <ClangTidyChecks>clang-analyzer-*, -clang-analyzer-core.CallAndMessage</ClangTidyChecks>
+    <MajorVersion Condition="'$(MajorVersion)' == ''">0</MajorVersion>
+    <MinorVersion Condition="'$(MinorVersion)' == ''">0</MinorVersion>
+    <PatchVersion Condition="'$(PatchVersion)' == ''">0</PatchVersion>
+    <!-- 可通过 VersionString 区分开发版本和发布版本 -->
+    <VersionString Condition="'$(VersionString)' == '' And ('$(MajorVersion)' != '0' Or '$(MinorVersion)' != '0' Or '$(PatchVersion)' != '0')">$(MajorVersion).$(MinorVersion).$(PatchVersion)</VersionString>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Configuration">
+    <PlatformToolset Condition="$(UseClangCL)">ClangCL</PlatformToolset>
+    <PlatformToolset Condition="!$(UseClangCL)">v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <UseDebugLibraries Condition="'$(Configuration)' == 'Debug'">true</UseDebugLibraries>
+  </PropertyGroup>
+</Project>

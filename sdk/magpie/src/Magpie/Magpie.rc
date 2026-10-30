@@ -1,0 +1,16 @@
+#pragma code_page(65001)
+
+#include "winres.h"
+#include "resource.h"
+
+// en-US
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Icon
+//
+
+// Icon with lowest ID value placed first to ensure application icon
+// remains consistent on all systems.
+IDI_APP                 ICON                    "Magpie.ico"

@@ -1,0 +1,353 @@
+#pragma once
+#include "Event.h"
+#include "Profile.h"
+#include "Shortcut.h"
+#include "Singleton.h"
+#include <rapidjson/document.h>
+#include <rapidjson/stringbuffer.h>
+#include <winrt/Magpie.h>
+
+namespace Magpie {
+
+struct ScalingMode;
+
+enum class AppTheme {
+	Light,
+	Dark,
+	System
+};
+
+class AppSettings : public Singleton<AppSettings> {
+	friend Singleton<AppSettings>;
+
+public:
+	~AppSettings();
+
+	bool Initialize() noexcept;
+	void Uninitialize() noexcept;
+
+	winrt::fire_and_forget SaveAsync() noexcept;
+
+	const std::filesystem::path& ConfigDir() const noexcept {
+		return _configDir;
+	}
+
+	bool IsPortableMode() const noexcept {
+		return _isPortableMode;
+	}
+
+	void IsPortableMode(bool value) noexcept;
+
+	int Language() const noexcept {
+		return _language;
+	}
+
+	void Language(int);
+
+	AppTheme Theme() const noexcept {
+		return _theme;
+	}
+	void Theme(AppTheme value);
+
+	winrt::Point MainWindowCenter() const noexcept {
+		return _mainWindowCenter;
+	}
+
+	winrt::Size MainWindowSizeInDips() const noexcept {
+		return _mainWindowSizeInDips;
+	}
+
+	bool IsMainWindowMaximized() const noexcept {
+		return _isMainWindowMaximized;
+	}
+
+	const Shortcut& GetShortcut(winrt::Magpie::ShortcutAction action) const {
+		return _shortcuts[(size_t)action];
+	}
+
+	void SetShortcut(winrt::Magpie::ShortcutAction action, const Shortcut& value);
+
+	uint32_t CountdownSeconds() const noexcept {
+		return _countdownSeconds;
+	}
+
+	void CountdownSeconds(uint32_t value) noexcept;
+
+	bool IsDeveloperMode() const noexcept {
+		return _isDeveloperMode;
+	}
+
+	void IsDeveloperMode(bool value) noexcept;
+
+	bool IsDebugMode() const noexcept {
+		return _isDebugMode;
+	}
+
+	void IsDebugMode(bool value) noexcept {
+		_isDebugMode = value;
+		SaveAsync();
+	}
+
+	bool IsBenchmarkMode() const noexcept {
+		return _isBenchmarkMode;
+	}
+
+	void IsBenchmarkMode(bool value) noexcept {
+		_isBenchmarkMode = value;
+		SaveAsync();
+	}
+
+	bool IsTopmostDisabled() const noexcept {
+		return _isTopmostDisabled;
+	}
+
+	void IsTopmostDisabled(bool value) noexcept {
+		_isTopmostDisabled = value;
+		SaveAsync();
+	}
+
+	bool IsEffectCacheDisabled() const noexcept {
+		return _isEffectCacheDisabled;
+	}
+
+	void IsEffectCacheDisabled(bool value) noexcept {
+		_isEffectCacheDisabled = value;
+		SaveAsync();
+	}
+
+	bool IsFontCacheDisabled() const noexcept {
+		return _isFontCacheDisabled;
+	}
+
+	void IsFontCacheDisabled(bool value) noexcept {
+		_isFontCacheDisabled = value;
+		SaveAsync();
+	}
+
+	bool IsSaveEffectSources() const noexcept {
+		return _isSaveEffectSources;
+	}
+
+	void IsSaveEffectSources(bool value) noexcept {
+		_isSaveEffectSources = value;
+		SaveAsync();
+	}
+
+	bool IsWarningsAreErrors() const noexcept {
+		return _isWarningsAreErrors;
+	}
+
+	void IsWarningsAreErrors(bool value) noexcept {
+		_isWarningsAreErrors = value;
+		SaveAsync();
+	}
+
+	bool IsFP16Disabled() const noexcept {
+		return _isFP16Disabled;
+	}
+
+	void IsFP16Disabled(bool value) noexcept {
+		_isFP16Disabled = value;
+		SaveAsync();
+	}
+
+	bool IsAllowScalingMaximized() const noexcept {
+		return _isAllowScalingMaximized;
+	}
+
+	void IsAllowScalingMaximized(bool value) noexcept {
+		_isAllowScalingMaximized = value;
+		SaveAsync();
+	}
+
+	bool IsKeepScreenOn() const noexcept {
+		return _isKeepScreenOn;
+	}
+
+	void IsKeepScreenOn(bool value) noexcept {
+		_isKeepScreenOn = value;
+		SaveAsync();
+	}
+
+	bool IsSimulateExclusiveFullscreen() const noexcept {
+		return _isSimulateExclusiveFullscreen;
+	}
+
+	void IsSimulateExclusiveFullscreen(bool value) noexcept {
+		_isSimulateExclusiveFullscreen = value;
+		SaveAsync();
+	}
+
+	Profile& DefaultProfile() noexcept {
+		return _defaultProfile;
+	}
+
+	std::vector<Profile>& Profiles() noexcept {
+		return _profiles;
+	}
+
+	bool IsAlwaysRunAsAdmin() const noexcept {
+		return _isAlwaysRunAsAdmin;
+	}
+
+	void IsAlwaysRunAsAdmin(bool value) noexcept;
+
+	bool IsShowNotifyIcon() const noexcept {
+		return _isShowNotifyIcon;
+	}
+
+	void IsShowNotifyIcon(bool value) noexcept;
+
+	bool IsInlineParams() const noexcept {
+		return _isInlineParams;
+	}
+
+	void IsInlineParams(bool value) noexcept {
+		_isInlineParams = value;
+		SaveAsync();
+	}
+
+	std::vector<ScalingMode>& ScalingModes() noexcept {
+		return _scalingModes;
+	}
+
+	bool IsAutoCheckForUpdates() const noexcept {
+		return _isAutoCheckForUpdates;
+	}
+
+	void IsAutoCheckForUpdates(bool value) noexcept {
+		_isAutoCheckForUpdates = value;
+		IsAutoCheckForUpdatesChanged.Invoke(value);
+		SaveAsync();
+	}
+
+	bool IsCheckForPreviewUpdates() const noexcept {
+		return _isCheckForPreviewUpdates;
+	}
+
+	void IsCheckForPreviewUpdates(bool value) noexcept {
+		_isCheckForPreviewUpdates = value;
+		SaveAsync();
+	}
+
+	std::chrono::system_clock::time_point UpdateCheckDate() const noexcept {
+		return _updateCheckDate;
+	}
+
+	void UpdateCheckDate(std::chrono::system_clock::time_point value) noexcept {
+		_updateCheckDate = value;
+	}
+
+	DuplicateFrameDetectionMode DuplicateFrameDetectionMode() const noexcept {
+		return _duplicateFrameDetectionMode;
+	}
+
+	void DuplicateFrameDetectionMode(enum DuplicateFrameDetectionMode value) noexcept {
+		_duplicateFrameDetectionMode = value;
+		SaveAsync();
+	}
+
+	bool IsStatisticsForDynamicDetectionEnabled() const noexcept {
+		return _isStatisticsForDynamicDetectionEnabled;
+	}
+
+	void IsStatisticsForDynamicDetectionEnabled(bool value) noexcept {
+		_isStatisticsForDynamicDetectionEnabled = value;
+		SaveAsync();
+	}
+
+	float MinFrameRate() const noexcept {
+		return _minFrameRate;
+	}
+
+	void MinFrameRate(float value) noexcept {
+		_minFrameRate = value;
+		SaveAsync();
+	}
+
+	phmap::flat_hash_map<std::string, OverlayWindowOption>& OverlayWindowOptions() noexcept {
+		return _overlayWindowOptions;
+	}
+
+	Event<AppTheme> ThemeChanged;
+	Event<winrt::Magpie::ShortcutAction> ShortcutChanged;
+	Event<uint32_t> CountdownSecondsChanged;
+	Event<bool> IsShowNotifyIconChanged;
+	Event<bool> IsAutoCheckForUpdatesChanged;
+
+private:
+	AppSettings();
+
+	void _UpdateWindowPlacement() noexcept;
+
+	rapidjson::StringBuffer _WriteConfigJson() const noexcept;
+
+	void _LoadSettings(const rapidjson::GenericObject<true, rapidjson::Value>& root) noexcept;
+
+	bool _LoadProfile(
+		const rapidjson::GenericObject<true, rapidjson::Value>& profileObj,
+		Profile& profile,
+		bool isDefault = false
+	) const noexcept;
+
+	void _SetInitialSettings() noexcept;
+
+	bool _UpdateConfigPath(std::filesystem::path* existingConfigPath = nullptr) noexcept;
+
+	std::array<Shortcut, (size_t)winrt::Magpie::ShortcutAction::COUNT_OR_NONE> _shortcuts;
+
+	std::vector<ScalingMode> _scalingModes;
+
+	Profile _defaultProfile;
+	std::vector<Profile> _profiles;
+
+	std::filesystem::path _configDir;
+	std::filesystem::path _configPath;
+
+	// LocalizationService::SupportedLanguages 索引
+	// -1 表示使用系统设置
+	int _language = -1;
+
+	// 保存窗口中心点和 DPI 无关的窗口尺寸
+	winrt::Point _mainWindowCenter{};
+	// 小于零表示默认位置和尺寸
+	winrt::Size _mainWindowSizeInDips{ -1.0f,-1.0f };
+
+	AppTheme _theme = AppTheme::System;
+	// 必须在 1~5 之间
+	uint32_t _countdownSeconds = 3;
+
+	// 上一次自动检查更新的日期
+	std::chrono::system_clock::time_point _updateCheckDate;
+
+	::Magpie::DuplicateFrameDetectionMode _duplicateFrameDetectionMode =
+		DuplicateFrameDetectionMode::Dynamic;
+
+	float _minFrameRate = 10.0f;
+
+	phmap::flat_hash_map<std::string, OverlayWindowOption> _overlayWindowOptions;
+
+	std::atomic<bool> _isSaving = false;
+	bool _isPortableMode = false;
+	bool _isAlwaysRunAsAdmin = false;
+	bool _isDeveloperMode = false;
+	bool _isDebugMode = false;
+	bool _isBenchmarkMode = false;
+	bool _isTopmostDisabled = false;
+	bool _isEffectCacheDisabled = false;
+	bool _isFontCacheDisabled = false;
+	bool _isSaveEffectSources = false;
+	bool _isWarningsAreErrors = false;
+	bool _isAllowScalingMaximized = false;
+	bool _isKeepScreenOn = false;
+	bool _isSimulateExclusiveFullscreen = false;
+	bool _isInlineParams = false;
+	bool _isShowNotifyIcon = true;
+	bool _isMainWindowMaximized = false;
+	bool _isAutoCheckForUpdates = true;
+	bool _isCheckForPreviewUpdates = false;
+	bool _isStatisticsForDynamicDetectionEnabled = false;
+	bool _isFP16Disabled = false;
+};
+
+}

@@ -1,0 +1,6 @@
+[requires]
+fmt/12.0.0
+spdlog/1.16.0
+
+[generators]
+MSBuildDeps
